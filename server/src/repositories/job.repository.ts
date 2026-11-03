@@ -277,6 +277,14 @@ export class JobRepository {
       case JobName.DatabaseBackup: {
         return { deduplication: { id: JobName.DatabaseBackup } };
       }
+      // fork: derived-twins re-queues these with a delay while a twin asset does the same work
+      case JobName.AssetGenerateThumbnails:
+      case JobName.AssetEncodeVideo:
+      case JobName.SmartSearch:
+      case JobName.Ocr:
+      case JobName.AssetDetectFaces: {
+        return item.data.delay ? { delay: item.data.delay } : null;
+      }
       default: {
         return null;
       }
