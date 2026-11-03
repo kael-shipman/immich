@@ -1,3 +1,10 @@
+> [!NOTE]
+> **This is a fork of Immich.** On top of upstream, it lets library assets that refer to the same file (for example
+> when several users' libraries index the same folders) share thumbnails, video transcodes and machine-learning
+> results, and keeps manual face corrections in step between them. It's opt-in (`IMMICH_SHARE_DERIVED_DATA`).
+> Why it exists, how it's maintained, and how to resolve rebase conflicts: [fork/README.md](fork/README.md). The
+> design: [fork/IMPLEMENTATION.md](fork/IMPLEMENTATION.md). Everything below is upstream's README.
+
 <p align="center"> 
   <br/>
   <a href="https://opensource.org/license/agpl-v3"><img src="https://img.shields.io/badge/License-AGPL_v3-blue.svg?color=3F51B5&style=for-the-badge&label=License&logoColor=000000&labelColor=ececec" alt="License: AGPLv3"></a>
