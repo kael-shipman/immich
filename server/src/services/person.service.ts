@@ -50,6 +50,7 @@ import { PersonUserTable } from 'src/schema/tables/person-user.table.js';
 import { BaseService } from 'src/services/base.service.js';
 import type { JobItem, JobOf } from 'src/types.js';
 import { getDimensions, getMyPartnerIds } from 'src/utils/asset.util.js';
+import { isDerivedDataSharingEnabled, mirrorFaceDeletion, mirrorFaces, twinFaces } from 'src/utils/derived-twins.js';
 import { ImmichFileResponse } from 'src/utils/file.js';
 import { isHttpException } from 'src/utils/logger.js';
 import { mimeTypes } from 'src/utils/mime-types.js';
@@ -124,6 +125,14 @@ export class PersonService extends BaseService {
 
       result.push(mapPerson(person));
     }
+
+    // fork: derived-twins (H6): the same faces on twin assets follow
+    for (const assetId of new Set(dto.data.map((item) => item.assetId))) {
+      for (const moved of await mirrorFaces(this.twinFaceRepos(), assetId)) {
+        changeFeaturePhoto.set(personKey(moved), moved);
+      }
+    }
+
     if (changeFeaturePhoto.size > 0) {
       await this.createNewFeaturePhoto(changeFeaturePhoto.values().toArray());
     }
@@ -141,6 +150,11 @@ export class PersonService extends BaseService {
     const person = await this.findOrFail(auth, personGroupId);
 
     await this.personRepository.reassignFace(face.id, person.personGroupId);
+    // fork: derived-twins (H6): the same face on twin assets follows
+    const moved = await mirrorFaces(this.twinFaceRepos(), face.assetId);
+    if (moved.length > 0) {
+      await this.createNewFeaturePhoto(moved);
+    }
     if (person.faceAssetId === null) {
       await this.createNewFeaturePhoto([person]);
     }
@@ -382,7 +396,8 @@ export class PersonService extends BaseService {
   }
 
   @OnJob({ name: JobName.AssetDetectFaces, queue: QueueName.FaceDetection })
-  async handleDetectFaces({ id }: JobOf<JobName.AssetDetectFaces>): Promise<JobStatus> {
+  async handleDetectFaces(job: JobOf<JobName.AssetDetectFaces>): Promise<JobStatus> {
+    const { id } = job;
     const { machineLearning } = await this.getConfig({ withCache: true });
     if (!isFacialRecognitionEnabled(machineLearning)) {
       return JobStatus.Skipped;
@@ -398,10 +413,19 @@ export class PersonService extends BaseService {
       return JobStatus.Skipped;
     }
 
-    const { imageHeight, imageWidth, faces } = await this.machineLearningRepository.detectFaces(
-      previewFile.path,
-      machineLearning.facialRecognition,
-    );
+    // fork: derived-twins (H5): reuse a twin asset's detected faces, or wait for the twin that's detecting them
+    const twin = await twinFaces({ ...this.twinFaceRepos(), storageRepository: this.storageRepository }, id, {
+      name: JobName.AssetDetectFaces,
+      data: job,
+    });
+    if (twin.action === 'wait') {
+      return JobStatus.Failed;
+    }
+
+    const { imageHeight, imageWidth, faces } =
+      twin.action === 'reuse'
+        ? twin.value
+        : await this.machineLearningRepository.detectFaces(previewFile.path, machineLearning.facialRecognition);
     this.logger.debug(`${faces.length} faces detected in ${previewFile.path}`);
 
     const facesToAdd: (Insertable<AssetFaceTable> & { id: string })[] = [];
@@ -440,6 +464,11 @@ export class PersonService extends BaseService {
 
     if (facesToAdd.length > 0 || faceIdsToRemove.length > 0 || embeddings.length > 0) {
       await this.personRepository.refreshFaces(facesToAdd, faceIdsToRemove, embeddings);
+    }
+
+    // fork: derived-twins (H5): take the twin's person assignments too, including its manual corrections
+    if (twin.action === 'reuse') {
+      await mirrorFaces(this.twinFaceRepos(), twin.twinId, id);
     }
 
     if (faceIdsToRemove.length > 0) {
@@ -840,12 +869,31 @@ export class PersonService extends BaseService {
     if (!person.faceAssetId) {
       await this.createNewFeaturePhoto([person]);
     }
+
+    // fork: derived-twins (H6): the face is added to twin assets too
+    const moved = await mirrorFaces(this.twinFaceRepos(), dto.assetId);
+    if (moved.length > 0) {
+      await this.createNewFeaturePhoto(moved);
+    }
   }
 
   async deleteFace(auth: AuthDto, id: string, dto: AssetFaceDeleteDto): Promise<void> {
     await this.requireAccess({ auth, permission: Permission.FaceDelete, ids: [id] });
 
-    return dto.force ? this.personRepository.deleteAssetFace(id) : this.personRepository.softDeleteAssetFaces(id);
+    // fork: derived-twins (H6): remember the face, to delete the same face on twin assets
+    const face = isDerivedDataSharingEnabled() ? await this.assetJobRepository.getTwinFace(id) : undefined;
+    await (dto.force ? this.personRepository.deleteAssetFace(id) : this.personRepository.softDeleteAssetFaces(id));
+    await mirrorFaceDeletion(this.twinFaceRepos(), face, !!dto.force);
+  }
+
+  // fork: derived-twins
+  private twinFaceRepos() {
+    return {
+      assetJobRepository: this.assetJobRepository,
+      personRepository: this.personRepository,
+      jobRepository: this.jobRepository,
+      logger: this.logger,
+    };
   }
 
   async getUsersForPeople(auth: AuthDto, dto: PersonUsersSearchDto): Promise<PersonUsersResponseDto> {

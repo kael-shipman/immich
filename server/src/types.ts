@@ -230,6 +230,10 @@ export interface IEntityJob extends IBaseJob {
   id: string;
   source?: JobSource;
   notify?: boolean;
+  /** How many times this job has waited for a twin asset to finish the same work (fork: derived-twins). */
+  twinWaits?: number;
+  /** The minimum time to wait to execute this job, in milliseconds (fork: derived-twins). */
+  delay?: number;
 }
 
 export interface IAssetDeleteJob extends IEntityJob {
