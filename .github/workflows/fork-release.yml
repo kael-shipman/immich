@@ -1,0 +1,323 @@
+# fork: rebases this fork's commits onto each upstream stable release, tests them, and publishes the server image.
+# See fork/README.md ("How the fork is organized", "Resolving rebase conflicts") and fork/IMPLEMENTATION.md, section 6.
+name: Fork release
+
+on:
+  schedule:
+    - cron: '23 */6 * * *'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Upstream release to build, e.g. v3.3.5 (default: the latest stable release). Rebuilds it if it was already published.'
+        required: false
+        type: string
+
+concurrency:
+  group: fork-release
+  cancel-in-progress: false
+
+permissions: {}
+
+env:
+  IMAGE: ghcr.io/${{ github.repository_owner }}/immich-server
+  UPSTREAM: immich-app/immich
+
+jobs:
+  check:
+    name: Check for a new upstream release
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      tag: ${{ steps.check.outputs.tag }}
+      major: ${{ steps.check.outputs.major }}
+      latest: ${{ steps.check.outputs.latest }}
+      build: ${{ steps.check.outputs.build }}
+    steps:
+      - name: Find the release to build
+        id: check
+        env:
+          GH_TOKEN: ${{ github.token }}
+          INPUT_TAG: ${{ inputs.tag }}
+          REPO: ${{ github.repository }}
+        run: |
+          latest_tag="$(gh api "repos/${UPSTREAM}/releases/latest" --jq .tag_name)"
+          tag="${INPUT_TAG:-$latest_tag}"
+          if ! [[ "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::Not a stable release tag: ${tag}"
+            exit 1
+          fi
+
+          build=true
+          if [ -z "$INPUT_TAG" ] && gh api "repos/${REPO}/git/ref/tags/twins/${tag}" > /dev/null 2>&1; then
+            build=false
+            echo "twins/${tag} is already published: nothing to do." | tee -a "$GITHUB_STEP_SUMMARY"
+          fi
+
+          {
+            echo "tag=${tag}"
+            echo "major=${tag%%.*}"
+            echo "latest=$([ "$tag" = "$latest_tag" ] && echo true || echo false)"
+            echo "build=${build}"
+          } | tee -a "$GITHUB_OUTPUT"
+
+  rebase:
+    name: Rebase onto the release
+    needs: check
+    if: ${{ needs.check.outputs.build == 'true' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      sha: ${{ steps.rebase.outputs.sha }}
+      old-sha: ${{ steps.rebase.outputs.old-sha }}
+      rebased: ${{ steps.rebase.outputs.rebased }}
+      conflict: ${{ steps.rebase.outputs.conflict }}
+      files: ${{ steps.rebase.outputs.files }}
+    steps:
+      - name: Checkout twins
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: twins
+          fetch-depth: 0
+          # Pushing a rebase carries upstream's workflow changes, which the default token may not push.
+          token: ${{ secrets.FORK_PUSH_TOKEN || github.token }}
+          persist-credentials: true
+
+      - name: Rebase
+        id: rebase
+        env:
+          TAG: ${{ needs.check.outputs.tag }}
+          HAS_PUSH_TOKEN: ${{ secrets.FORK_PUSH_TOKEN != '' }}
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          echo "old-sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+          base="$(cat fork/BASE)"
+          git fetch --no-tags "https://github.com/${UPSTREAM}.git" \
+            "+refs/tags/${TAG}:refs/tags/${TAG}" "+refs/tags/${base}:refs/tags/${base}"
+
+          if [ "$base" = "$TAG" ]; then
+            echo "Already based on ${TAG}." | tee -a "$GITHUB_STEP_SUMMARY"
+            echo "rebased=false" >> "$GITHUB_OUTPUT"
+          else
+            if [ "$HAS_PUSH_TOKEN" != 'true' ]; then
+              echo "::error::Rebasing needs the FORK_PUSH_TOKEN secret (contents and workflows write). See fork/README.md."
+              exit 1
+            fi
+
+            if ! git rebase --onto "$TAG" "$base" twins; then
+              {
+                echo 'conflict=true'
+                echo 'files<<EOF'
+                git diff --name-only --diff-filter=U
+                echo 'EOF'
+              } >> "$GITHUB_OUTPUT"
+              git rebase --abort
+              echo "::error::Rebasing onto ${TAG} conflicts. Resolve it as fork/README.md describes."
+              exit 1
+            fi
+
+            # Record the new base in the docs(fork) commit, the first commit of the stack.
+            echo "$TAG" > fork/BASE
+            docs="$(git rev-list --reverse "${TAG}..HEAD" | head -1)"
+            git commit --quiet --fixup="$docs" fork/BASE
+            GIT_SEQUENCE_EDITOR=: git rebase --quiet -i --autosquash "$TAG"
+
+            git push --force origin HEAD:refs/heads/twins-candidate
+            echo "rebased=true" >> "$GITHUB_OUTPUT"
+            echo "Rebased onto ${TAG}." | tee -a "$GITHUB_STEP_SUMMARY"
+          fi
+
+          echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+  test:
+    name: Test (${{ matrix.suite }})
+    needs: [check, rebase]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        suite: [ci-unit, ci-medium]
+    steps:
+      - name: Checkout the candidate
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.rebase.outputs.sha }}
+          persist-credentials: false
+          submodules: 'recursive'
+
+      - name: Setup Mise
+        uses: immich-app/devtools/actions/use-mise@06a9ef925332c91be647d6256642b86b398592c8 # use-mise-action-v3.2.1
+        with:
+          github_token: ${{ github.token }}
+
+      # As upstream's test.yml runs them: from server/. One retry, for transient registry rate limits when the medium
+      # tests' testcontainers pull their images.
+      - name: Run ${{ matrix.suite }}
+        working-directory: ./server
+        env:
+          SUITE: ${{ matrix.suite }}
+        run: mise run "$SUITE" || { echo "::warning::${SUITE} failed; retrying once"; sleep 60; mise run "$SUITE"; }
+
+  build:
+    name: Build (${{ matrix.platform }})
+    needs: [check, rebase, test]
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - platform: linux/amd64
+            runner: ubuntu-latest
+          - platform: linux/arm64
+            runner: ubuntu-24.04-arm
+    steps:
+      - name: Checkout the candidate
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.rebase.outputs.sha }}
+          persist-credentials: false
+
+      # The same single-platform build upstream's docker.yml uses (through multi-runner-build.yml).
+      - name: Build and push by digest
+        uses: immich-app/devtools/actions/image-build@236702d8cb0c9dd1ff155b73f9be789b1b2cd620 # image-build-action-v0.1.10
+        with:
+          context: .
+          dockerfile: server/Dockerfile
+          image: ${{ env.IMAGE }}
+          ghcr-token: ${{ github.token }}
+          platform: ${{ matrix.platform }}
+          artifact-key-base: immich-server-digests
+          build-args: |
+            DEVICE=cpu
+
+  publish:
+    name: Publish
+    needs: [check, rebase, build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      packages: write
+      issues: write
+      actions: write
+    steps:
+      - name: Download digests
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          path: ${{ runner.temp }}/digests
+          pattern: immich-server-digests-*
+          merge-multiple: true
+
+      - name: Login to GitHub Container Registry
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.repository_owner }}
+          password: ${{ github.token }}
+
+      - name: Create the multi-platform image and its tags
+        working-directory: ${{ runner.temp }}/digests
+        env:
+          TAG: ${{ needs.check.outputs.tag }}
+          MAJOR: ${{ needs.check.outputs.major }}
+          LATEST: ${{ needs.check.outputs.latest }}
+        run: |
+          tags=(-t "${IMAGE}:${TAG}")
+          if [ "$LATEST" = 'true' ]; then
+            tags+=(-t "${IMAGE}:${MAJOR}" -t "${IMAGE}:release")
+          fi
+          sources=()
+          for digest in *; do
+            sources+=("${IMAGE}@sha256:${digest}")
+          done
+          docker buildx imagetools create "${tags[@]}" "${sources[@]}"
+          echo "Published ${tags[*]//-t /}" | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: Checkout twins
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: twins
+          fetch-depth: 0
+          token: ${{ secrets.FORK_PUSH_TOKEN || github.token }}
+          persist-credentials: true
+
+      - name: Move twins and tag the build
+        env:
+          TAG: ${{ needs.check.outputs.tag }}
+          SHA: ${{ needs.rebase.outputs.sha }}
+          OLD_SHA: ${{ needs.rebase.outputs.old-sha }}
+          REBASED: ${{ needs.rebase.outputs.rebased }}
+        run: |
+          if [ "$REBASED" = 'true' ]; then
+            git fetch origin twins-candidate
+            git push --force-with-lease="twins:${OLD_SHA}" origin "${SHA}:refs/heads/twins"
+            git push origin --delete twins-candidate
+          fi
+          git tag -f "twins/${TAG}" "$SHA"
+          git push -f origin "refs/tags/twins/${TAG}"
+
+      - name: Close this release's failure issues
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.check.outputs.tag }}
+        run: |
+          gh issue list -R "$GITHUB_REPOSITORY" --state open --search "\"Fork release ${TAG}\" in:title" --json number --jq '.[].number' |
+            while read -r number; do
+              gh issue close -R "$GITHUB_REPOSITORY" "$number" --comment "Published in ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}."
+            done
+
+      - name: Keep upstream's workflows disabled
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh workflow list -R "$GITHUB_REPOSITORY" --all --json id,path,state \
+            --jq '.[] | select(.state == "active" and (.path | test("/fork-[^/]*\\.ya?ml$") | not)) | .id' |
+            while read -r id; do
+              gh workflow disable -R "$GITHUB_REPOSITORY" "$id"
+            done
+
+  report:
+    name: Report a failure
+    needs: [check, rebase, test, build, publish]
+    if: ${{ failure() && needs.check.outputs.build == 'true' }}
+    runs-on: ubuntu-latest
+    permissions:
+      issues: write
+    steps:
+      - name: Open or update the release's issue
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.check.outputs.tag }}
+          CONFLICT: ${{ needs.rebase.outputs.conflict }}
+          FILES: ${{ needs.rebase.outputs.files }}
+          RESULTS: rebase=${{ needs.rebase.result }} test=${{ needs.test.result }} build=${{ needs.build.result }} publish=${{ needs.publish.result }}
+        run: |
+          title="Fork release ${TAG} failed"
+          run_url="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+          {
+            if [ "$CONFLICT" = 'true' ]; then
+              echo "Rebasing the fork onto upstream ${TAG} conflicts in:"
+              echo
+              printf -- '- `%s`\n' $FILES
+              echo
+              echo 'Resolve it as [fork/README.md, "Resolving rebase conflicts"](../blob/twins/fork/README.md#resolving-rebase-conflicts) describes, then run the Fork release workflow again.'
+            else
+              echo "Building ${TAG} failed (${RESULTS})."
+            fi
+            echo
+            echo "Nothing was published: instances stay on the last good image. Run: ${run_url}"
+          } > body.md
+
+          number="$(gh issue list -R "$GITHUB_REPOSITORY" --state open --search "\"${title}\" in:title" --json number --jq '.[0].number // empty')"
+          if [ -n "$number" ]; then
+            gh issue comment -R "$GITHUB_REPOSITORY" "$number" --body-file body.md
+          else
+            gh issue create -R "$GITHUB_REPOSITORY" --title "$title" --body-file body.md
+          fi
