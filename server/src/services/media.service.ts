@@ -39,6 +39,7 @@ import { AssetJobRepository } from 'src/repositories/asset-job.repository.js';
 import { BoundingBox } from 'src/repositories/machine-learning.repository.js';
 import { BaseService } from 'src/services/base.service.js';
 import { getAssetFile, getDimensions } from 'src/utils/asset.util.js';
+import { reuseTwinEncodedVideo, reuseTwinThumbnails } from 'src/utils/derived-twins.js';
 import { checkFaceVisibility, checkOcrVisibility } from 'src/utils/editor.js';
 import { BaseConfig, ThumbnailConfig } from 'src/utils/media.js';
 import { mimeTypes } from 'src/utils/mime-types.js';
@@ -189,7 +190,8 @@ export class MediaService extends BaseService {
   }
 
   @OnJob({ name: JobName.AssetGenerateThumbnails, queue: QueueName.ThumbnailGeneration })
-  async handleGenerateThumbnails({ id }: JobOf<JobName.AssetGenerateThumbnails>): Promise<JobStatus> {
+  async handleGenerateThumbnails(job: JobOf<JobName.AssetGenerateThumbnails>): Promise<JobStatus> {
+    const { id } = job;
     const asset = await this.assetJobRepository.getForGenerateThumbnailJob(id);
     const config = await this.getConfig({ withCache: true });
 
@@ -203,8 +205,19 @@ export class MediaService extends BaseService {
       return JobStatus.Skipped;
     }
 
+    // fork: derived-twins (H1): reuse a twin asset's thumbnails, or wait for the twin that's making them
+    const twin = await reuseTwinThumbnails(this.twinRepos(), asset, config.image, {
+      name: JobName.AssetGenerateThumbnails,
+      data: job,
+    });
+    if (twin.action === 'wait') {
+      return JobStatus.Failed;
+    }
+
     let generated: Awaited<ReturnType<MediaService['generateImageThumbnails']>>;
-    if (asset.type === AssetType.Video || asset.originalFileName.toLowerCase().endsWith('.gif')) {
+    if (twin.action === 'reuse') {
+      generated = { ...twin.value, fullsizeDimensions: getDimensions(asset.exifInfo) };
+    } else if (asset.type === AssetType.Video || asset.originalFileName.toLowerCase().endsWith('.gif')) {
       this.logger.verbose(`Thumbnail generation for video ${id} ${asset.originalPath}`);
       generated = await this.generateVideoThumbnails(asset, config);
     } else if (asset.type === AssetType.Image) {
@@ -551,7 +564,8 @@ export class MediaService extends BaseService {
   }
 
   @OnJob({ name: JobName.AssetEncodeVideo, queue: QueueName.VideoConversion })
-  async handleVideoConversion({ id }: JobOf<JobName.AssetEncodeVideo>): Promise<JobStatus> {
+  async handleVideoConversion(job: JobOf<JobName.AssetEncodeVideo>): Promise<JobStatus> {
+    const { id } = job;
     const asset = await this.assetJobRepository.getForVideoConversion(id);
     if (!asset) {
       return JobStatus.Failed;
@@ -585,6 +599,21 @@ export class MediaService extends BaseService {
       }
 
       return JobStatus.Skipped;
+    }
+
+    // fork: derived-twins (H2): reuse a twin asset's transcode, or wait for the twin that's making it
+    const twin = await reuseTwinEncodedVideo(this.twinRepos(), asset, { name: JobName.AssetEncodeVideo, data: job });
+    if (twin.action === 'wait') {
+      return JobStatus.Failed;
+    }
+    if (twin.action === 'reuse') {
+      await this.assetRepository.upsertFile({
+        assetId: asset.id,
+        type: AssetFileType.EncodedVideo,
+        path: twin.value,
+        isEdited: false,
+      });
+      return JobStatus.Success;
     }
 
     const command = BaseConfig.create(ffmpeg, this.videoInterfaces).getCommand(target, videoStream, audioStream);
@@ -859,6 +888,16 @@ export class MediaService extends BaseService {
         `Asset ${assetId} has transparency but the configured format is ${format} which does not support it, consider using a format that does, such as ${ImageFormat.Webp}`,
       );
     }
+  }
+
+  // fork: derived-twins
+  private twinRepos() {
+    return {
+      assetJobRepository: this.assetJobRepository,
+      jobRepository: this.jobRepository,
+      storageRepository: this.storageRepository,
+      logger: this.logger,
+    };
   }
 
   private getImageFile(
