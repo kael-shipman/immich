@@ -5,6 +5,7 @@ import { OCR } from 'src/repositories/machine-learning.repository.js';
 import { BaseService } from 'src/services/base.service.js';
 import type { JobOf } from 'src/types.js';
 import { tokenizeForSearch } from 'src/utils/database.js';
+import { twinOcr } from 'src/utils/derived-twins.js';
 import { batched, isOcrEnabled } from 'src/utils/misc.js';
 
 @Injectable()
@@ -28,7 +29,8 @@ export class OcrService extends BaseService {
   }
 
   @OnJob({ name: JobName.Ocr, queue: QueueName.Ocr })
-  async handleOcr({ id }: JobOf<JobName.Ocr>): Promise<JobStatus> {
+  async handleOcr(job: JobOf<JobName.Ocr>): Promise<JobStatus> {
+    const { id } = job;
     const { machineLearning } = await this.getConfig({ withCache: true });
     if (!isOcrEnabled(machineLearning)) {
       return JobStatus.Skipped;
@@ -43,7 +45,26 @@ export class OcrService extends BaseService {
       return JobStatus.Skipped;
     }
 
-    const ocrResults = await this.machineLearningRepository.ocr(asset.previewFile, machineLearning.ocr);
+    // fork: derived-twins (H4): reuse a twin asset's OCR results, or wait for the twin that's making them
+    const twin = await twinOcr(
+      {
+        assetJobRepository: this.assetJobRepository,
+        jobRepository: this.jobRepository,
+        storageRepository: this.storageRepository,
+        ocrRepository: this.ocrRepository,
+        logger: this.logger,
+      },
+      id,
+      { name: JobName.Ocr, data: job },
+    );
+    if (twin.action === 'wait') {
+      return JobStatus.Failed;
+    }
+
+    const ocrResults =
+      twin.action === 'reuse'
+        ? twin.value
+        : await this.machineLearningRepository.ocr(asset.previewFile, machineLearning.ocr);
     const { ocrDataList, searchText } = this.parseOcrResults(id, ocrResults);
     await this.ocrRepository.upsert(id, ocrDataList, searchText);
 
