@@ -4,7 +4,7 @@ import { jsonArrayFrom, jsonObjectFrom } from 'kysely/helpers/postgres';
 import { InjectKysely } from 'nestjs-kysely';
 import { columns } from 'src/database.js';
 import { DummyValue, GenerateSql } from 'src/decorators.js';
-import { AssetFileType, AssetStatus, AssetType, AssetVisibility } from 'src/enum.js';
+import { AssetFileType, AssetStatus, AssetType, AssetVisibility, SourceType } from 'src/enum.js';
 import { DB } from 'src/schema/index.js';
 import {
   anyUuid,
@@ -469,5 +469,139 @@ export class AssetJobRepository {
   @GenerateSql({ params: [DummyValue.DATE], stream: true })
   streamForMigrationJob() {
     return this.db.selectFrom('asset').select(['id']).where('asset.deletedAt', 'is', null).stream();
+  }
+
+  // fork: derived-twins. Queries for reusing derived data between library assets of the same file (fork/README.md).
+
+  /**
+  The asset itself and every other live library asset with the same original path, type and file modification
+  time (its twins), ordered by ID.
+  */
+  getTwinGroup(id: string) {
+    return this.db
+      .selectFrom('asset')
+      .innerJoin('asset as source', (join) =>
+        join
+          .onRef('source.originalPath', '=', 'asset.originalPath')
+          .onRef('source.type', '=', 'asset.type')
+          .onRef('source.fileModifiedAt', '=', 'asset.fileModifiedAt'),
+      )
+      .innerJoin('user', 'user.id', 'asset.ownerId')
+      .leftJoin('asset_job_status', 'asset_job_status.assetId', 'asset.id')
+      .where('source.id', '=', asUuid(id))
+      .where('source.libraryId', 'is not', null)
+      .where('asset.libraryId', 'is not', null)
+      .where('asset.deletedAt', 'is', null)
+      .where('asset.isOffline', '=', false)
+      .select([
+        'asset.id',
+        'asset.ownerId',
+        'asset.originalPath',
+        'asset.isEdited',
+        'asset.thumbhash',
+        'user.clusterGroupId',
+        'asset_job_status.ocrAt',
+        'asset_job_status.facesRecognizedAt',
+      ])
+      .select((eb) =>
+        jsonArrayFrom(
+          eb
+            .selectFrom('asset_file')
+            .select(['asset_file.type', 'asset_file.path', 'asset_file.isProgressive', 'asset_file.isTransparent'])
+            .whereRef('asset_file.assetId', '=', 'asset.id')
+            .where('asset_file.isEdited', '=', false)
+            .where('asset_file.type', 'in', [
+              AssetFileType.Thumbnail,
+              AssetFileType.Preview,
+              AssetFileType.FullSize,
+              AssetFileType.EncodedVideo,
+            ]),
+        ).as('files'),
+      )
+      .select((eb) =>
+        eb
+          .exists(
+            eb
+              .selectFrom('smart_search')
+              .select('smart_search.assetId')
+              .whereRef('smart_search.assetId', '=', 'asset.id'),
+          )
+          .as('hasEmbedding'),
+      )
+      .orderBy('asset.id')
+      .execute();
+  }
+
+  getTwinEmbedding(id: string) {
+    return this.db
+      .selectFrom('smart_search')
+      .select('smart_search.embedding')
+      .where('smart_search.assetId', '=', asUuid(id))
+      .executeTakeFirst();
+  }
+
+  /** An asset's detected (machine-learning) faces, with their embeddings. */
+  getTwinDetectedFaces(id: string) {
+    return this.db
+      .selectFrom('asset_face')
+      .innerJoin('face_search', 'face_search.faceId', 'asset_face.id')
+      .select([
+        'asset_face.imageWidth',
+        'asset_face.imageHeight',
+        'asset_face.boundingBoxX1',
+        'asset_face.boundingBoxY1',
+        'asset_face.boundingBoxX2',
+        'asset_face.boundingBoxY2',
+        'face_search.embedding',
+      ])
+      .where('asset_face.assetId', '=', asUuid(id))
+      .where('asset_face.deletedAt', 'is', null)
+      .where('asset_face.sourceType', '=', SourceType.MachineLearning)
+      .execute();
+  }
+
+  /** An asset's faces, for mirroring face edits between twins. */
+  getTwinFaces(id: string) {
+    return this.db
+      .selectFrom('asset_face')
+      .leftJoin('person', (join) =>
+        join
+          .onRef('person.personGroupId', '=', 'asset_face.personGroupId')
+          .onRef('person.ownerId', '=', 'asset_face.ownerId'),
+      )
+      .select([
+        'asset_face.id',
+        'asset_face.assetId',
+        'asset_face.personGroupId',
+        'asset_face.sourceType',
+        'asset_face.imageWidth',
+        'asset_face.imageHeight',
+        'asset_face.boundingBoxX1',
+        'asset_face.boundingBoxY1',
+        'asset_face.boundingBoxX2',
+        'asset_face.boundingBoxY2',
+        'person.faceAssetId',
+      ])
+      .where('asset_face.assetId', '=', asUuid(id))
+      .where('asset_face.deletedAt', 'is', null)
+      .execute();
+  }
+
+  /** One face, whether or not it's deleted, for mirroring its deletion to twins. */
+  getTwinFace(id: string) {
+    return this.db
+      .selectFrom('asset_face')
+      .select([
+        'asset_face.id',
+        'asset_face.assetId',
+        'asset_face.imageWidth',
+        'asset_face.imageHeight',
+        'asset_face.boundingBoxX1',
+        'asset_face.boundingBoxY1',
+        'asset_face.boundingBoxX2',
+        'asset_face.boundingBoxY2',
+      ])
+      .where('asset_face.id', '=', asUuid(id))
+      .executeTakeFirst();
   }
 }

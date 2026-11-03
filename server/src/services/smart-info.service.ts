@@ -5,6 +5,7 @@ import { AssetVisibility, DatabaseLock, ImmichWorker, JobName, JobStatus, QueueN
 import type { ArgOf } from 'src/repositories/event.repository.js';
 import { BaseService } from 'src/services/base.service.js';
 import type { JobOf } from 'src/types.js';
+import { twinEmbedding } from 'src/utils/derived-twins.js';
 import { batched, getCLIPModelInfo, isSmartSearchEnabled } from 'src/utils/misc.js';
 
 @Injectable()
@@ -84,7 +85,8 @@ export class SmartInfoService extends BaseService {
   }
 
   @OnJob({ name: JobName.SmartSearch, queue: QueueName.SmartSearch })
-  async handleEncodeClip({ id }: JobOf<JobName.SmartSearch>): Promise<JobStatus> {
+  async handleEncodeClip(job: JobOf<JobName.SmartSearch>): Promise<JobStatus> {
+    const { id } = job;
     const { machineLearning } = await this.getConfig({ withCache: true });
     if (!isSmartSearchEnabled(machineLearning)) {
       return JobStatus.Skipped;
@@ -100,7 +102,25 @@ export class SmartInfoService extends BaseService {
       return JobStatus.Skipped;
     }
 
-    const embedding = await this.machineLearningRepository.encodeImage(previewFile.path, machineLearning.clip);
+    // fork: derived-twins (H3): reuse a twin asset's embedding, or wait for the twin that's making it
+    const twin = await twinEmbedding(
+      {
+        assetJobRepository: this.assetJobRepository,
+        jobRepository: this.jobRepository,
+        storageRepository: this.storageRepository,
+        logger: this.logger,
+      },
+      id,
+      { name: JobName.SmartSearch, data: job },
+    );
+    if (twin.action === 'wait') {
+      return JobStatus.Failed;
+    }
+
+    const embedding =
+      twin.action === 'reuse'
+        ? twin.value
+        : await this.machineLearningRepository.encodeImage(previewFile.path, machineLearning.clip);
 
     if (this.databaseRepository.isBusy(DatabaseLock.CLIPDimSize)) {
       this.logger.verbose(`Waiting for CLIP dimension size to be updated`);
