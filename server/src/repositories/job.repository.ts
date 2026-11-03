@@ -210,7 +210,8 @@ export class JobRepository {
         options: this.getJobOptions(item) || undefined,
       } as JobItem & { data: any; options: JobsOptions | undefined };
 
-      if (job.options?.jobId || job.options?.deduplication) {
+      // fork: derived-twins: a delayed job too, since addBulk() reads options from `opts` and drops `options` (R6)
+      if (job.options?.jobId || job.options?.deduplication || job.options?.delay) {
         // need to use add() instead of addBulk() for jobId/deduplication to take effect
         promises.push(this.getQueue(queueName).add(item.name, item.data, job.options));
       } else {
@@ -276,6 +277,14 @@ export class JobRepository {
       }
       case JobName.DatabaseBackup: {
         return { deduplication: { id: JobName.DatabaseBackup } };
+      }
+      // fork: derived-twins re-queues these with a delay while a twin asset does the same work
+      case JobName.AssetGenerateThumbnails:
+      case JobName.AssetEncodeVideo:
+      case JobName.SmartSearch:
+      case JobName.Ocr:
+      case JobName.AssetDetectFaces: {
+        return item.data.delay ? { delay: item.data.delay } : null;
       }
       default: {
         return null;

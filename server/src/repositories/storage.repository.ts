@@ -75,6 +75,10 @@ export class StorageRepository {
     return fs.stat(filepath);
   }
 
+  link(source: string, target: string) {
+    return fs.link(source, target);
+  }
+
   createFile(filepath: string, buffer: Buffer) {
     return fs.writeFile(filepath, buffer, { flag: 'wx' });
   }
