@@ -1,0 +1,43 @@
+# fork: tests work on the fork's patch (dev/** branches). Never builds or publishes. See fork/IMPLEMENTATION.md, section 6.
+name: Fork CI
+
+on:
+  push:
+    branches: ['dev/**']
+  workflow_dispatch:
+
+concurrency:
+  group: fork-ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions: {}
+
+jobs:
+  test:
+    name: Test (${{ matrix.suite }})
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        suite: [ci-unit, ci-medium]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          submodules: 'recursive'
+
+      - name: Setup Mise
+        uses: immich-app/devtools/actions/use-mise@caac7f7e4298458a14238959504f411fc6cc7f06 # use-mise-action-v3.2.3
+        with:
+          github_token: ${{ github.token }}
+
+      # As upstream's test.yml runs them: from server/. One retry, for transient registry rate limits when the medium
+      # tests' testcontainers pull their images.
+      - name: Run ${{ matrix.suite }}
+        working-directory: ./server
+        env:
+          SUITE: ${{ matrix.suite }}
+        run: mise run "$SUITE" || { echo "::warning::${SUITE} failed; retrying once"; sleep 60; mise run "$SUITE"; }
