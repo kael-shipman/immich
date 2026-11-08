@@ -236,6 +236,17 @@ export class MetadataService extends BaseService {
       return;
     }
 
+    // fork: new-sidecars. A sidecar that appeared after the file was indexed is found first, as the sidecar check
+    // (Discover) would find it, so refreshing the metadata reads it.
+    if (
+      process.env.IMMICH_FIND_NEW_SIDECARS === 'true' &&
+      !getAssetFiles(asset.files).sidecarFile &&
+      (await this.handleSidecarCheck({ id: asset.id })) === JobStatus.Success
+    ) {
+      const found = await this.assetJobRepository.getForMetadataExtraction(asset.id);
+      asset.files = found?.files ?? asset.files;
+    }
+
     const [exifResult, stats] = await Promise.all([
       this.getExifTags(asset),
       this.storageRepository.stat(asset.originalPath),
