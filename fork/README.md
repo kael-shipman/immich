@@ -4,7 +4,7 @@ This repository is a fork of [Immich](https://github.com/immich-app/immich). Ups
 repository root. This document covers only what the fork adds, why, and how it's kept current. The full design is in
 [IMPLEMENTATION.md](IMPLEMENTATION.md).
 
-**Status:** implemented, tested and published (`v3.3.6`, with the second patch); not yet proven on a real instance. Section [Status](#status) tracks progress,
+**Status:** implemented, tested and published (`v3.3.6`, with the second patch), and checked on a dev instance with two users. Section [Status](#status) tracks progress,
 and [RESUME.md](RESUME.md) is the handoff for whoever picks up the work next.
 
 ## Why it exists
@@ -80,6 +80,7 @@ metadata extraction (a refresh, for example) finds such a sidecar first, as Disc
 
 | 2026-11-07 | Upstream `v3.3.6`: the first automatic rebase, published (after `FORK_PUSH_TOKEN` was replaced). |
 | 2026-11-08 | The second patch, finding new sidecars (`IMMICH_FIND_NEW_SIDECARS`, IMPLEMENTATION.md section 10), with 5 unit and 2 medium tests; `v3.3.6` republished with it. |
+| 2026-11-08 | First run on a real instance (a dev instance with two users and machine learning): each kind of work ran once. It found R6's delay lost in `queueAll`'s bulk path (IMPLEMENTATION.md, R6); fixed, with 2 unit tests, and `v3.3.6` republished. |
 
 Next: see [RESUME.md](RESUME.md).
 
@@ -157,6 +158,9 @@ section 3.4, before editing anything.
      rebase base. Keep ours.
    - **`server/src/services/person.service.ts`:** the most likely conflict, since upstream reworks people often. The
      detection hook replaces one call. The face-mirroring hooks are one call each, after the stock change succeeds.
+   - **`server/src/repositories/job.repository.ts`:** two hunks, a case in `getJobOptions` and one condition in
+     `queueAll` (a job with a delay is added with `add()`). If upstream reworks `queueAll`, check that a delayed job
+     still reaches BullMQ with its delay: `job.repository.spec.ts` tests it.
    - **`server/src/repositories/asset-job.repository.ts`:** our queries are appended at the end of the class. Keep
      both upstream's additions and ours.
    - **`server/src/services/metadata.service.ts`:** the second patch's one hook (H7), in `handleMetadataExtraction`

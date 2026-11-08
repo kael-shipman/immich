@@ -205,8 +205,12 @@ in the same cluster group, because a `person_group` belongs to one cluster group
     its data. Upstream hands the handler the same data object that `onDone` passes on to the follow-up jobs
     (`job.repository.ts`, `run`; `job.service.ts`, `onDone`), so they start with no delay and a fresh wait budget.
     If upstream ever copies the data instead, the follow-up jobs simply start without the fields.
-  - **Delays need two small hunks:**
+  - **Delays need three small hunks:**
     - `getJobOptions` returns `{ delay }` for the fork's re-queued jobs;
+    - `queueAll` adds a job with a delay through `Queue.add()`, as it already does for a `jobId` or deduplication.
+      Its bulk path hands BullMQ's `addBulk()` the options under `options`, but `addBulk()` reads `opts`, so a
+      bulk-added job loses its delay and runs at once. Without this hunk, a waiting job re-queues itself 20 times in
+      a second, exhausts its budget, and does the work anyway (found by the dev-instance check, 2026-11-08);
     - `IEntityJob` gets optional `twinWaits` and `delay` fields.
 
 ### 3.4 Hooks
@@ -248,9 +252,9 @@ Kept small and separate, for easy rebases:
 | `server/src/utils/derived-twins.ts` (new) | The helpers (`reuseTwinThumbnails`, `reuseTwinEncodedVideo`, `twinEmbedding`, `twinOcr`, `twinFaces`, `mirrorFaces`, `mirrorFaceDeletion`, `faceIou`) and the shared decision (`resolveFromTwins`: R1, R2, R5, R6). Each takes the repositories it needs as arguments, so `base.service.ts`'s constructor (which every test helper mirrors) isn't touched. Links only ever happen inside Immich's `thumbs/` and `encoded-video/` folders; anything else is refused. | ~470 lines |
 | `server/src/repositories/asset-job.repository.ts` | Queries appended at the end of the class: `getTwinGroup` (the asset and its twins, with files, job status, embedding flag and cluster group), `getTwinEmbedding`, `getTwinDetectedFaces` (ML faces with `face_search` embeddings), `getTwinFaces` (all live faces, with the owner's feature face), `getTwinFace`. No `@GenerateSql` decorators, so upstream's SQL snapshot check isn't involved. | ~130 lines |
 | `media.service.ts`, `smart-info.service.ts`, `ocr.service.ts`, `person.service.ts` | The hooks (H1–H6). The handlers take the whole job data (`job`) instead of `{ id }`, to re-queue it. `media.service.ts` and `person.service.ts` each get a private `twinRepos()` / `twinFaceRepos()` method. Every hunk is marked `// fork: derived-twins`. | ~10–40 lines each |
-| `server/src/repositories/job.repository.ts`, `server/src/types.ts` | `delay` in `getJobOptions` for the five job types; `twinWaits` and `delay` on `IEntityJob` (R6) | ~15 lines |
+| `server/src/repositories/job.repository.ts`, `server/src/types.ts` | `delay` in `getJobOptions` for the five job types, and `queueAll` adding delayed jobs one by one; `twinWaits` and `delay` on `IEntityJob` (R6) | ~15 lines |
 | `server/src/repositories/storage.repository.ts`, `server/test/repositories/storage.repository.mock.ts` | `link(source, target)`, and its mock | ~5 lines |
-| `server/src/utils/derived-twins.spec.ts` (new) and `server/test/medium/specs/services/derived-twins.service.spec.ts` (new) | Tests (section 5) | ~700 lines |
+| `server/src/utils/derived-twins.spec.ts`, `server/src/repositories/job.repository.spec.ts` and `server/test/medium/specs/services/derived-twins.service.spec.ts` (all new) | Tests (section 5) | ~740 lines |
 
 ### 3.6 Not shared
 
@@ -326,7 +330,10 @@ a JPEG and a short MP4.
 
 **What exists (2026-11-03):** 25 unit tests (`server/src/utils/derived-twins.spec.ts`, with a real temporary
 directory for the links) and 7 medium tests (`derived-twins.service.spec.ts`: `getTwinGroup`, H3 reuse, H3 wait, the
-switch off, H4, H5 with the pull, H6 deletion). Not yet automated: the full thumbnail and transcode jobs end to end,
+switch off, H4, H5 with the pull, H6 deletion). Since 2026-11-08, 2 more unit tests
+(`server/src/repositories/job.repository.spec.ts`): a re-queued job reaches BullMQ with its delay, and jobs without
+one are still added in bulk. The other tests mock the job repository, which is how the lost delay went unnoticed. Not
+yet automated: the full thumbnail and transcode jobs end to end,
 and the race between two scans; those are covered by the dev-instance check before deployment.
 
 **Running the tests without mise** (for example on a machine with only Docker): run them in a `node:24` container,
@@ -437,8 +444,18 @@ Resolved while implementing (2026-11-03):
 - `deleteFace` mirrors the soft or hard delete the user chose.
 - `twinFaces` leaves out faces the twin's owner deleted, so a deleted false face isn't copied.
 
+Checked by hand on a dev instance (2026-11-08): two users in one cluster group, libraries over one folder (32 JPEGs,
+2 RAWs, 2 videos), with real machine learning. Each kind of work ran once for both, whether the libraries were scanned
+one after the other or together (with the `queueAll` hunk in R6, which that check found missing). Disk use halved,
+and face edits reached the twin both ways. Regenerating rewrote the shared file (R4), and deleting one user's library
+left the other's files whole. Recognition: since twins' faces have identical embeddings, each face counts twice
+toward the minimum faces for a new person, so a person seen in two shared photos is created for the second user first,
+and the first user's faces join it at the next missing-faces recognition run. That's how recognition counts within a
+cluster group, not the patch.
+
 Still open:
-- An end-to-end test of H1 and H2 through `MediaService` with real files, and of the R6 race between two scans.
+- An automated end-to-end test of H1 and H2 through `MediaService` with real files, and of the R6 race between two
+  scans (it needs a real queue, which the medium tests don't have).
 - Whether a manual "refresh faces" on one twin should also refresh the other (today: no; each owner's refresh is
   their own).
 
@@ -483,3 +500,4 @@ the asset is loaded; if upstream starts looking for new sidecars itself, drop th
 | 2026-11-03 | First version, from v3.3.5's source: hooks H1–H6, rules R1–R6, publishing workflow. |
 | 2026-11-03 | Implemented. Changes from the first version: the queries' real names (3.5); proceeding jobs clear their wait fields (R6); the build calls upstream's `image-build` action per platform rather than `multi-runner-build.yml` (6.1); `FORK_PUSH_TOKEN`, issues and the default branch (6.1); open items resolved (9). |
 | 2026-11-08 | The second patch, finding new sidecars (section 10, `IMMICH_FIND_NEW_SIDECARS`), on v3.3.6. |
+| 2026-11-08 | R6's delay was lost: `queueAll`'s bulk path drops job options, so a waiting job re-ran at once and gave up after its 20 waits. A third R6 hunk sends delayed jobs through `add()` (3.3, 3.5), with 2 unit tests (5). The dev-instance check's results (9). |
